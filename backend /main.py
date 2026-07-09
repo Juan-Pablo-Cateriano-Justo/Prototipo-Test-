@@ -3,9 +3,8 @@ Main FastAPI application entry point
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
 from database import engine, get_db, Base
-from routes import products, cart, orders
+from routes import products, cart, orders, auth
 from controllers.products import init_sample_products
 
 # Create database tables
@@ -27,8 +26,10 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(auth.router)
 app.include_router(products.router)
 app.include_router(cart.router)
+app.include_router(cart.cleanup_router)
 app.include_router(orders.router)
 
 
