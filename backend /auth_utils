@@ -1,0 +1,92 @@
+"""
+Authentication utilities: password hashing and JWT token handling.
+
+Design decisions (documented per the challenge's "document your assumptions" guidance):
+- JWT-based auth (stateless) instead of server-side sessions, since it avoids adding a
+  session store and works cleanly with the existing session_id-based cart.
+- Passwords are hashed with bcrypt via passlib; plaintext passwords are never stored.
+- Cart and product endpoints stay open to anonymous users (see routes/cart.py), but
+  order creation and order history strictly require a valid token.
+"""
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+import bcrypt
+from jose import JWTError, jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+
+from database import get_db
+import models
+
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-secret-key-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
+
+security = HTTPBearer(auto_error=False)
+
+
+def hash_password(password: str) -> str:
+    """Hash a password with bcrypt directly (bypasses a known passlib/bcrypt
+    version-compatibility bug)."""
+    pw_bytes = password.encode("utf-8")[:72]  # bcrypt's own hard limit
+    return bcrypt.hashpw(pw_bytes, bcrypt.gensalt()).decode("utf-8")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    pw_bytes = plain_password.encode("utf-8")[:72]
+    return bcrypt.checkpw(pw_bytes, hashed_password.encode("utf-8"))
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_access_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+) -> models.User:
+    """Require a valid JWT; used to protect order endpoints."""
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = decode_access_token(credentials.credentials)
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+) -> Optional[models.User]:
+    """Like get_current_user, but returns None instead of raising. Used by cart endpoints
+    so anonymous shopping keeps working while logged-in users get their cart linked."""
+    if credentials is None:
+        return None
+    try:
+        payload = decode_access_token(credentials.credentials)
+    except HTTPException:
+        return None
+    user_id = payload.get("sub")
+    if user_id is None:
+        return None
+    return db.query(models.User).filter(models.User.id == user_id).first()
